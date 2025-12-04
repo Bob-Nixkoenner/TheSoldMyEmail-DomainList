@@ -4,104 +4,175 @@ import sys
 import requests
 import argparse
 import os
+import re
 from urllib.parse import urlparse
 from datetime import datetime
 
-REPO = "svemailproject/TheySoldMyEmail"
-API_URL = f"https://api.github.com/repos/{REPO}/issues"
-PER_PAGE = 100
 
+REPO_CONFIG = [
+    {
+        "repo": "svemailproject/TheySoldMyEmail",   # Original
+        "offset": 0,
+    },
+    {
+        "repo": "Bob-Nixkoenner/TheySoldMyEmail",   # dein Fork
+        "offset": 2000,
+    },
+]
+
+
+
+PER_PAGE = 100
 LATEST_FILENAME = "issues-latest.csv"
 
-# Häufige Multi-Part-TLDs für bessere Root-Domain-Erkennung
-MULTI_PART_TLDS = {
-    "co.uk", "org.uk", "gov.uk", "ac.uk",
-    "com.au", "net.au", "org.au",
-    "co.nz",
-    "com.br", "com.ar", "com.mx",
-    "co.jp",
+SKIP_HOSTS = {
+    "github.com",
+    "www.github.com",
+    "api.github.com",
 }
 
 
-def extract_domains(title: str):
+def normalize_host(host: str) -> str:
     """
-    Nimmt den Issue-Titel und gibt zurück:
-    - domain: normalisierte Domain/Host (ohne Schema, mit evtl. www/subdomain)
-    - root_domain: ohne www. und ohne Subdomains (soweit heuristisch erkennbar)
-    Falls nichts Verwertbares gefunden wird:
-    - domain und root_domain = leerer String
+    Nimmt einen Host und gibt eine bereinigte Domain zurück
+    (klein, ohne Userinfo/Port). Gibt "" zurück, wenn es
+    nicht nach Domain aussieht.
     """
-    original = (title or "").strip()
-    if not original:
-        return "", ""
+    host = (host or "").strip().lower()
+    if not host:
+        return ""
 
-    tokens = original.split()
+    # Userinfo entfernen
+    if "@" in host:
+        host = host.split("@", 1)[-1]
+
+    # Port entfernen
+    if ":" in host:
+        host = host.split(":", 1)[0]
+
+    # muss mindestens einen Punkt haben
+    if "." not in host:
+        return ""
+
+    return host
+
+
+def clickable_domain(domain: str) -> str:
+    """
+    Aus der erkannten Domain eine klickbare Variante bauen:
+    immer "www." + Domain (ohne führendes www.).
+    LibreOffice/Excel machen daraus anklickbare Links.
+    """
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return ""
+
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    if not domain:
+        return ""
+
+    return f"www.{domain}"
+
+
+def extract_from_title(title: str) -> str:
+    if not title:
+        return ""
+    tokens = title.strip().split()
     candidate = None
 
-    # Bevorzugt ein Token mit Punkt oder Slash
+    # Bevorzugt Token mit Punkt oder Slash
     for tok in tokens:
         if "." in tok or "/" in tok:
             candidate = tok
             break
 
-    # Wenn nichts mit Punkt gefunden: nimm erstes Wort als Notlösung
+    # Fallback: erstes Wort
     if candidate is None and tokens:
         candidate = tokens[0]
-    elif candidate is None:
-        return "", ""
+    if candidate is None:
+        return ""
 
-    # Randzeichen entfernen
     candidate = candidate.strip(" ,;()[]{}<>\"'")
+    if not candidate:
+        return ""
 
-    # Für urlparse: Schema ergänzen falls fehlt
+    # Schema ergänzen falls fehlt
     if candidate.startswith(("http://", "https://")):
         parsed = urlparse(candidate)
     else:
         parsed = urlparse("http://" + candidate)
 
     host = parsed.netloc or parsed.path
-
-    # Userinfo und Port entfernen
-    if "@" in host:
-        host = host.split("@", 1)[-1]
-    if ":" in host:
-        host = host.split(":", 1)[0]
-
-    host = host.strip().lower()
-
-    # Wenn kein Punkt: vermutlich keine Domain
-    if not host or "." not in host:
-        return "", ""
-
-    domain = host
-
-    # www. entfernen
-    if host.startswith("www."):
-        without_www = host[4:]
-    else:
-        without_www = host
-
-    parts = without_www.split(".")
-    root_domain = without_www
-
-    # Subdomains via Heuristik entfernen
-    if len(parts) > 2:
-        last_two = ".".join(parts[-2:])
-        if last_two in MULTI_PART_TLDS and len(parts) >= 3:
-            root_domain = ".".join(parts[-3:])
-        else:
-            root_domain = last_two
-
-    return domain, root_domain
+    return normalize_host(host)
 
 
-def fetch_open_issues():
+def extract_from_body(body: str) -> str:
+    if not body:
+        return ""
+    text = body.strip()
+    if not text:
+        return ""
+
+    # 1) Zeilen mit "domain"
+    for line in text.splitlines():
+        low = line.lower()
+        if "domain" in low:
+            # URL in dieser Zeile
+            m = re.search(r'https?://([^\s/)+]+)', line, flags=re.IGNORECASE)
+            if m:
+                host = normalize_host(m.group(1))
+                if host and host not in SKIP_HOSTS:
+                    return host
+            # nackte Domain in dieser Zeile
+            m = re.search(r'\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b', line, flags=re.IGNORECASE)
+            if m:
+                host = normalize_host(m.group(1))
+                if host and host not in SKIP_HOSTS:
+                    return host
+
+    # 2) Allgemeine URLs im Body
+    for host in re.findall(r'https?://([^\s/)+]+)', text, flags=re.IGNORECASE):
+        host = normalize_host(host)
+        if host and host not in SKIP_HOSTS:
+            return host
+
+    # 3) Nackte Domains im Body
+    for host in re.findall(r'\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b', text, flags=re.IGNORECASE):
+        host = normalize_host(host)
+        if host and host not in SKIP_HOSTS:
+            return host
+
+    return ""
+
+
+def extract_domain(title: str, body: str):
     """
-    Holt alle offenen Issues (ohne Pull Requests) mit Pagination.
+    Versucht zuerst Body, dann Titel.
+    Gibt (domain, source) zurück.
+    domain = nackte Domain (ohne www.-Zwang),
+    source = "body" / "title" / "none".
     """
+    # Body
+    d = extract_from_body(body)
+    if d:
+        return d, "body"
+
+    # Titel
+    d = extract_from_title(title)
+    if d:
+        return d, "title"
+
+    return "", "none"
+
+
+def fetch_open_issues(repo: str):
+    api_url = f"https://api.github.com/repos/{repo}/issues"
     page = 1
     headers = {
-        # Optional:
+        "Accept": "application/vnd.github+json",
+        # Optional: Token bei Bedarf
         # "Authorization": "Bearer YOUR_TOKEN_HERE"
     }
 
@@ -111,15 +182,13 @@ def fetch_open_issues():
             "per_page": PER_PAGE,
             "page": page,
         }
-        r = requests.get(API_URL, headers=headers, params=params, timeout=30)
+        r = requests.get(api_url, headers=headers, params=params, timeout=30)
         r.raise_for_status()
         issues = r.json()
-
         if not issues:
             break
 
         for issue in issues:
-            # PRs rausfiltern
             if "pull_request" in issue:
                 continue
             yield issue
@@ -131,9 +200,6 @@ def fetch_open_issues():
 
 
 def rotate_latest_if_exists():
-    """
-    Wenn LATEST_FILENAME existiert, nach issues-YYYYMMDD_HHMMSS.csv umbenennen.
-    """
     if os.path.exists(LATEST_FILENAME):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         archived = f"issues-{ts}.csv"
@@ -144,7 +210,10 @@ def rotate_latest_if_exists():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Exportiert offene GitHub-Issues mit Domains als CSV."
+        description=(
+            "Exportiert offene GitHub-Issues aus mehreren Repos in eine CSV.\n"
+            "Die Repos und Offsets werden in REPO_CONFIG definiert."
+        )
     )
     parser.add_argument(
         "-o", "--output",
@@ -153,64 +222,88 @@ def main():
     parser.add_argument(
         "--stdout",
         action="store_true",
-        help="Schreibt CSV auf stdout (keine Dateien, kein Auto-Rotation)."
+        help="CSV auf stdout ausgeben (keine Dateien, keine Rotation)."
     )
     args = parser.parse_args()
 
-    # stdout-Modus: keine Rotation, kein Dateikram
+    if not REPO_CONFIG:
+        print("REPO_CONFIG ist leer – bitte mindestens ein Repo eintragen.")
+        sys.exit(1)
+
     if args.stdout:
         out = sys.stdout
         close_out = False
     else:
-        # Wenn explizit -o genutzt wird: keine Auto-Rotation, einfach in diese Datei schreiben
         if args.output:
             filename = args.output
         else:
-            # Auto-Rotation für issues-latest.csv
             archived = rotate_latest_if_exists()
             if archived:
                 print(f"Vorherige Version archiviert als: {archived}")
             filename = LATEST_FILENAME
 
-        out = open(filename, "w", newline="", encoding="utf-8")
+        # BOM für Excel/LibreOffice-Erkennung
+        out = open(filename, "w", newline="", encoding="utf-8-sig")
         close_out = True
 
     writer = csv.writer(out, delimiter=";")
     writer.writerow([
-        "issue_number",
+        "issue_number",     # interne ID = offset + GitHub-Issue-Nummer
         "issue_url",
-        "author",
-        "domain",
-        "root_domain",
         "title",
-        "labels",
+        "domain",
+        "domain_source",
+        "author",
         "created_at",
+        "repo",             # z.B. svemailproject/TheySoldMyEmail-Advent
+        "gh_issue_number",  # originale GitHub-Issue-Nummer
     ])
 
-    for issue in fetch_open_issues():
-        number = issue.get("number")
-        title = (issue.get("title") or "").strip()
-        issue_url = f"https://github.com/{REPO}/issues/{number}"
-        author = (issue.get("user") or {}).get("login", "")
+    total_written = 0
 
-        domain, root_domain = extract_domains(title)
-        labels = ",".join(lbl.get("name", "") for lbl in issue.get("labels", []))
-        created = issue.get("created_at", "")
+    for cfg in REPO_CONFIG:
+        repo = cfg["repo"]
+        offset = int(cfg.get("offset", 0))
 
-        writer.writerow([
-            number,
-            issue_url,
-            author,
-            domain,
-            root_domain,
-            title,
-            labels,
-            created,
-        ])
+        print(f"[INFO] Hole Issues aus {repo} (Offset {offset})...")
+        count_repo = 0
+
+        for issue in fetch_open_issues(repo):
+            gh_number = issue.get("number")
+            if gh_number is None:
+                continue
+
+            internal_number = offset + int(gh_number)
+
+            title = (issue.get("title") or "").strip()
+            body = issue.get("body") or ""
+            issue_url = f"https://github.com/{repo}/issues/{gh_number}"
+            author = (issue.get("user") or {}).get("login", "")
+            created = issue.get("created_at", "")
+
+            raw_domain, source = extract_domain(title, body)
+            dom = clickable_domain(raw_domain)
+
+            writer.writerow([
+                internal_number,
+                issue_url,
+                title,
+                dom,
+                source,
+                author,
+                created,
+                repo,
+                gh_number,
+            ])
+
+            count_repo += 1
+            total_written += 1
+
+        print(f"[INFO] Repo {repo}: {count_repo} Issues exportiert.")
 
     if close_out:
         out.close()
-        print(f"CSV geschrieben: {filename}")
+        print(f"[INFO] CSV geschrieben: {filename}, insgesamt {total_written} Issues.")
 
 
 if __name__ == "__main__":

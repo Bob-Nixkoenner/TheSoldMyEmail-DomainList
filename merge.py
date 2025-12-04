@@ -119,10 +119,13 @@ def report_duplicates(rows):
     else:
         print("[OK] Keine doppelten issue_number gefunden.")
 
-    # 2) Doppelte Domains (mit Ignorierliste)
+    # 2) Doppelte Domains
     if not rows or "domain" not in rows[0]:
         print("[INFO] Keine 'domain'-Spalte gefunden, Domain-Duplikatprüfung übersprungen.")
         return
+
+    # Haben wir eine Repo-Spalte? Wenn ja, prüfen wir je Repo.
+    has_repo = any("repo" in r for r in rows)
 
     domain_map = {}
     for row in rows:
@@ -137,17 +140,42 @@ def report_duplicates(rows):
         if not nd:
             continue
 
-        domain_map.setdefault(nd, []).append(num if num else "?")
+        if has_repo:
+            repo = (row.get("repo") or "").strip()
+            key = (repo, nd)
+        else:
+            key = nd
 
-    dup_domains = {d: lst for d, lst in domain_map.items() if len(lst) > 1}
+        domain_map.setdefault(key, []).append(num if num else "?")
 
-    if dup_domains:
-        print("\n[INFO] Doppelte Domains gefunden (normalisiert, ohne www., exkl. Ignore-Liste):")
-        for d, issues in sorted(dup_domains.items(), key=lambda x: x[0]):
-            issues_clean = ", ".join(sorted(set(i for i in issues if i)))
-            print(f"  {d}  -> Issues: {issues_clean}")
+    if has_repo:
+        # Duplikate je Repo
+        dup_domains = {k: lst for k, lst in domain_map.items() if len(lst) > 1}
+
+        if dup_domains:
+            print("\n[INFO] Doppelte Domains je Repo gefunden "
+                  "(normalisiert, ohne www., exkl. Ignore-Liste):")
+            for (repo, dom), issues in sorted(
+                dup_domains.items(),
+                key=lambda x: ((x[0][0] or ""), x[0][1])
+            ):
+                issues_clean = ", ".join(sorted(set(i for i in issues if i)))
+                repo_label = repo or "<unbekanntes Repo>"
+                print(f"  [{repo_label}] {dom}  -> Issues: {issues_clean}")
+        else:
+            print("[OK] Keine doppelten Domains je Repo gefunden.")
     else:
-        print("[OK] Keine doppelten Domains gefunden.")
+        # Altes Verhalten: Duplikate global
+        dup_domains = {d: lst for d, lst in domain_map.items() if len(lst) > 1}
+
+        if dup_domains:
+            print("\n[INFO] Doppelte Domains gefunden "
+                  "(normalisiert, ohne www., exkl. Ignore-Liste):")
+            for d, issues in sorted(dup_domains.items(), key=lambda x: x[0]):
+                issues_clean = ", ".join(sorted(set(i for i in issues if i)))
+                print(f"  {d}  -> Issues: {issues_clean}")
+        else:
+            print("[OK] Keine doppelten Domains gefunden.")
 
 
 def main():
